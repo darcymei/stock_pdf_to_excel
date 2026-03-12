@@ -1,0 +1,101 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>富途证券月结单 PDF → Excel</title>
+    <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+    <div class="container">
+        <h1>富途证券月结单转换工具</h1>
+        <p class="subtitle">上传PDF月结单，自动提取交易明细并生成Excel文件</p>
+
+        <div class="upload-area" id="uploadArea">
+            <input type="file" id="fileInput" accept=".pdf" hidden>
+            <div class="upload-icon">📄</div>
+            <p>点击或拖拽上传PDF文件</p>
+            <span class="file-name" id="fileName"></span>
+        </div>
+
+        <button id="submitBtn" disabled>转换为Excel</button>
+
+        <div class="status" id="status"></div>
+    </div>
+
+    <script>
+        const uploadArea = document.getElementById('uploadArea');
+        const fileInput = document.getElementById('fileInput');
+        const submitBtn = document.getElementById('submitBtn');
+        const fileName = document.getElementById('fileName');
+        const status = document.getElementById('status');
+
+        uploadArea.addEventListener('click', () => fileInput.click());
+
+        uploadArea.addEventListener('dragover', (e) => {
+            e.preventDefault();
+            uploadArea.classList.add('dragover');
+        });
+
+        uploadArea.addEventListener('dragleave', () => {
+            uploadArea.classList.remove('dragover');
+        });
+
+        uploadArea.addEventListener('drop', (e) => {
+            e.preventDefault();
+            uploadArea.classList.remove('dragover');
+            if (e.dataTransfer.files.length) {
+                fileInput.files = e.dataTransfer.files;
+                onFileSelected();
+            }
+        });
+
+        fileInput.addEventListener('change', onFileSelected);
+
+        function onFileSelected() {
+            if (fileInput.files.length) {
+                fileName.textContent = fileInput.files[0].name;
+                submitBtn.disabled = false;
+                status.textContent = '';
+                status.className = 'status';
+            }
+        }
+
+        submitBtn.addEventListener('click', async () => {
+            if (!fileInput.files.length) return;
+
+            submitBtn.disabled = true;
+            status.textContent = '正在处理，请稍候...';
+            status.className = 'status loading';
+
+            const formData = new FormData();
+            formData.append('file', fileInput.files[0]);
+
+            try {
+                const resp = await fetch('/upload', { method: 'POST', body: formData });
+
+                if (!resp.ok) {
+                    const err = await resp.json();
+                    throw new Error(err.error || '转换失败');
+                }
+
+                const blob = await resp.blob();
+                const url = URL.createObjectURL(blob);
+                const a = document.createElement('a');
+                a.href = url;
+                a.download = fileInput.files[0].name.replace('.pdf', '.xlsx').replace('.PDF', '.xlsx');
+                a.click();
+                URL.revokeObjectURL(url);
+
+                status.textContent = '转换完成，文件已下载！';
+                status.className = 'status success';
+            } catch (e) {
+                status.textContent = e.message;
+                status.className = 'status error';
+            } finally {
+                submitBtn.disabled = false;
+            }
+        });
+    </script>
+</body>
+</html>
