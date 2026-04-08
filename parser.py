@@ -21,14 +21,14 @@ def parse_int(s: str) -> int:
 
 # Regex patterns
 RE_DIRECTION = re.compile(
-    r"^(買入開倉|賣出平倉)\s+(HKD|USD|CNH)\s+"
+    r"^(買入開倉|賣出平倉)\s+(HKD|USD|CNH|SGD)\s+"
     r"([\d,]+)\s+([\d,.]+)\s+([\d,.]+)\s+(-?[\d,.]+)$"
 )
 
 # Tail pattern: exchange currency date date qty price amount net_amount
 RE_DETAIL_TAIL = re.compile(
-    r"(SEHK|FUTU OTC|ARCX|CDED|JNST|EDGX)\s+"
-    r"(HKD|USD|CNH)\s+"
+    r"([A-Z][A-Z0-9]+|FUTU OTC)\s+"
+    r"(HKD|USD|CNH|SGD)\s+"
     r"(\d{4}/\d{2}/\d{2})\s+(\d{4}/\d{2}/\d{2})\s+"
     r"([\d,]+)\s+([\d,.]+)\s+([\d,.]+)\s+(-?[\d,.]+)$"
 )
@@ -270,7 +270,7 @@ def parse_ipo(pdf_path: str) -> List[dict]:
 
 
 def _map_exchange(currency: str) -> str:
-    return "HKG" if currency == "HKD" else "US" if currency == "USD" else currency
+    return "HKG" if currency == "HKD" else "US" if currency == "USD" else "SG" if currency == "SGD" else currency
 
 
 def groups_to_rows(groups: List[TransactionGroup], pdf_path: str = "") -> List[dict]:
