@@ -8,7 +8,7 @@ from fastapi.templating import Jinja2Templates
 from parser import parse_pdf, groups_to_rows
 from excel_writer import create_excel
 
-app = FastAPI(title="富途证券月结单 PDF → Excel")
+app = FastAPI(title="月结单 PDF → Excel")
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 app.mount("/static", StaticFiles(directory=os.path.join(BASE_DIR, "static")), name="static")
