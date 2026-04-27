@@ -5,6 +5,53 @@ import pdfplumber
 from models import TradeDetail, TransactionGroup
 
 
+def _deduplicate_bold_text(line: str) -> str:
+    """Detect and fix doubled characters from bold PDF text extraction.
+
+    Some PDFs render bold text in a way that pdfplumber extracts each character
+    twice consecutively (e.g. '交交易易' instead of '交易').
+    """
+    if len(line) < 2:
+        return line
+    # Check if the line follows the doubled pattern: every pair of adjacent
+    # characters at even positions are identical
+    chars = list(line)
+    if len(chars) % 2 == 0:
+        is_doubled = all(chars[i] == chars[i + 1] for i in range(0, len(chars), 2))
+        if is_doubled:
+            return "".join(chars[i] for i in range(0, len(chars), 2))
+
+    # CJK-pair fallback: handle mixed tokens like '港港股股IPO公公'
+    # where CJK chars are doubled but Latin chars are not
+    result = []
+    j = 0
+    has_dedup = False
+    while j < len(chars):
+        result.append(chars[j])
+        if j + 1 < len(chars) and _is_cjk(chars[j]) and chars[j] == chars[j + 1]:
+            j += 2  # skip the duplicate
+            has_dedup = True
+        else:
+            j += 1
+    if has_dedup:
+        return "".join(result)
+    return line
+
+
+def _deduplicate_line(line: str) -> str:
+    """Apply de-duplication to individual tokens in a line.
+
+    Handles lines where some tokens are doubled (bold) and others are not,
+    e.g. '買買入入開開倉倉 01133(哈爾濱電 HKD 20,000 5.3000 106,000.00 -106,163.93'
+    """
+    tokens = line.split()
+    result = []
+    for token in tokens:
+        deduped = _deduplicate_bold_text(token)
+        result.append(deduped)
+    return " ".join(result)
+
+
 def _is_cjk(ch: str) -> bool:
     cp = ord(ch)
     return (0x4E00 <= cp <= 0x9FFF or 0x3400 <= cp <= 0x4DBF or
@@ -42,9 +89,18 @@ RE_CONTINUATION = re.compile(r"^(.+?)\)\s+(\d{2}:\d{2}:\d{2})$")
 
 RE_END_SECTION = re.compile(r"^成交金額合計")
 
+# Combined direction + stock code line (account 3862 corporate format)
+# e.g. "買入開倉 01133(哈爾濱電 HKD 20,000 5.3000 106,000.00 -106,163.93"
+RE_DIR_STOCK = re.compile(
+    r"^(買入開倉|賣出平倉)\s+"
+    r"([\w.]+)\((.+?)(\))?\s+"
+    r"(HKD|USD|CNH|SGD)\s+"
+    r"([\d,]+)\s+([\d,.]+)\s+([\d,.]+)\s+(-?[\d,.]+)$"
+)
+
 # Page header lines to skip
 RE_PAGE_HEADER = re.compile(
-    r"^(保證金綜合帳戶|買賣方向\s+代碼名稱|製備日期)"
+    r"^(保證金綜合帳戶|買賣方向\s+代碼名稱|製備日期|交易所/市場)"
 )
 
 RE_PERIOD_LINE = re.compile(r"^\d{4}/\d{2}$")
@@ -73,21 +129,24 @@ def extract_transaction_text(pdf_path: str) -> str:
                 if not line:
                     continue
 
+                # Apply per-token de-duplication for bold text
+                normalized = _deduplicate_line(line)
+
                 if not in_section:
-                    if "交易-股票和股票期權" in line:
+                    if "交易-股票和股票期權" in normalized:
                         in_section = True
                     continue
 
-                if RE_END_SECTION.match(line):
+                if RE_END_SECTION.match(normalized):
                     return "\n".join(lines_all)
 
                 # Skip page headers
-                if RE_PAGE_HEADER.match(line):
+                if RE_PAGE_HEADER.match(normalized):
                     continue
-                if RE_PERIOD_LINE.match(line):
+                if RE_PERIOD_LINE.match(normalized):
                     continue
 
-                lines_all.append(line)
+                lines_all.append(normalized)
 
     return "\n".join(lines_all)
 
@@ -124,15 +183,18 @@ def parse_pdf(pdf_path: str) -> List[TransactionGroup]:
             current_group.details.append(detail)
         pending_detail = None
 
+    last_corp_stock = None  # track stock info from corporate-format lines
+
     i = 0
     while i < len(lines):
         line = lines[i]
 
-        # Check for direction line
+        # Check for direction line (standard format)
         m_dir = RE_DIRECTION.match(line)
         if m_dir:
             # Finalize any pending detail from previous group
             finalize_pending()
+            last_corp_stock = None
             current_group = TransactionGroup(
                 direction=m_dir.group(1),
                 currency=m_dir.group(2),
@@ -144,10 +206,45 @@ def parse_pdf(pdf_path: str) -> List[TransactionGroup]:
             i += 1
             continue
 
+        # Check for combined direction + stock line (corporate format)
+        m_ds = RE_DIR_STOCK.match(line)
+        if m_ds:
+            finalize_pending()
+            last_corp_stock = None
+            currency = m_ds.group(5)
+            current_group = TransactionGroup(
+                direction=m_ds.group(1),
+                currency=currency,
+                total_quantity=parse_int(m_ds.group(6)),
+                total_amount=parse_number(m_ds.group(8)),
+                total_net_amount=parse_number(m_ds.group(9)),
+            )
+            groups.append(current_group)
+            stock_code = m_ds.group(2)
+            stock_name = m_ds.group(3)
+            name_complete = m_ds.group(4) is not None
+            pending_detail = {
+                "stock_code": stock_code,
+                "stock_name": stock_name,
+                "name_complete": name_complete,
+                "exchange": "",
+                "currency": currency,
+                "date": "",
+                "settlement_date": "",
+                "quantity": parse_int(m_ds.group(6)),
+                "price": parse_number(m_ds.group(7)),
+                "amount": parse_number(m_ds.group(8)),
+                "net_amount": parse_number(m_ds.group(9)),
+            }
+            last_corp_stock = {"stock_code": stock_code, "stock_name": stock_name}
+            i += 1
+            continue
+
         # Check for fee line
         m_fee = RE_FEE.match(line)
         if m_fee and current_group:
             finalize_pending()
+            last_corp_stock = None
             fees = parse_fee_line(line)
             current_group.fees = fees
             current_group.fee_subtotal = fees.get("小計", 0.0)
@@ -157,9 +254,41 @@ def parse_pdf(pdf_path: str) -> List[TransactionGroup]:
         # Check for detail line (has exchange+currency+dates+numbers at end)
         m_tail = RE_DETAIL_TAIL.search(line)
         if m_tail and current_group:
+            prefix = line[: m_tail.start()].strip()
+
+            if not prefix and pending_detail and not pending_detail["exchange"]:
+                # Corporate format: first fill line follows direction+stock line
+                pending_detail["exchange"] = m_tail.group(1)
+                pending_detail["date"] = m_tail.group(3)
+                pending_detail["settlement_date"] = m_tail.group(4)
+                pending_detail["quantity"] = parse_int(m_tail.group(5))
+                pending_detail["price"] = parse_number(m_tail.group(6))
+                pending_detail["amount"] = parse_number(m_tail.group(7))
+                pending_detail["net_amount"] = parse_number(m_tail.group(8))
+                i += 1
+                continue
+
+            if not prefix and last_corp_stock:
+                # Corporate format: additional fill line for the same stock
+                finalize_pending()
+                pending_detail = {
+                    "stock_code": last_corp_stock["stock_code"],
+                    "stock_name": last_corp_stock["stock_name"],
+                    "name_complete": True,
+                    "exchange": m_tail.group(1),
+                    "currency": m_tail.group(2),
+                    "date": m_tail.group(3),
+                    "settlement_date": m_tail.group(4),
+                    "quantity": parse_int(m_tail.group(5)),
+                    "price": parse_number(m_tail.group(6)),
+                    "amount": parse_number(m_tail.group(7)),
+                    "net_amount": parse_number(m_tail.group(8)),
+                }
+                i += 1
+                continue
+
             finalize_pending()
 
-            prefix = line[: m_tail.start()].strip()
             # Parse stock code and name from prefix
             # Could be: "01712(龍資源)" (complete) or "00836(華潤電" (wrapped)
             code_match = re.match(r"^([\w.]+)\((.+?)(\))?$", prefix)
@@ -200,13 +329,28 @@ def parse_pdf(pdf_path: str) -> List[TransactionGroup]:
         if m_cont and pending_detail and not pending_detail["name_complete"]:
             name_suffix = m_cont.group(1)
             existing = pending_detail["stock_name"]
-            # Add space if both parts are non-CJK (e.g., "Galiano" + "Gold")
             if existing and name_suffix and not _is_cjk(existing[-1]) and not _is_cjk(name_suffix[0]):
                 pending_detail["stock_name"] = existing + " " + name_suffix
             else:
                 pending_detail["stock_name"] = existing + name_suffix
             pending_detail["name_complete"] = True
+            if last_corp_stock:
+                last_corp_stock["stock_name"] = pending_detail["stock_name"]
             finalize_pending(m_cont.group(2))
+            i += 1
+            continue
+
+        # Check for name-only continuation: "name_suffix)" without time
+        if pending_detail and not pending_detail["name_complete"] and line.endswith(")"):
+            name_suffix = line[:-1]
+            existing = pending_detail["stock_name"]
+            if existing and name_suffix and not _is_cjk(existing[-1]) and not _is_cjk(name_suffix[0]):
+                pending_detail["stock_name"] = existing + " " + name_suffix
+            else:
+                pending_detail["stock_name"] = existing + name_suffix
+            pending_detail["name_complete"] = True
+            if last_corp_stock:
+                last_corp_stock["stock_name"] = pending_detail["stock_name"]
             i += 1
             continue
 
@@ -236,7 +380,7 @@ def parse_ipo(pdf_path: str) -> List[dict]:
                 continue
             lines = text.split("\n")
             for j, line in enumerate(lines):
-                line = line.strip()
+                line = _deduplicate_line(line.strip())
                 if "資產進出" in line:
                     in_section = True
                     continue
